@@ -3,6 +3,7 @@ export {
   KmerHostingError,
   type ApiEnvelope,
   type ClientOptions,
+  type DomainSearchResult,
   type MutationOptions,
   type RequestOptions,
   type KvmAction,

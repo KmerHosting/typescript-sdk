@@ -6,8 +6,13 @@ export type KvmAction = "start" | "stop" | "shutdown" | "restart";
 export type ClientOptions = {
   apiKey?: string;
   baseUrl?: string;
+  /** Public domain search service. Default: https://domain.kmerhosting.com */
+  domainSearchUrl?: string;
   fetch?: typeof globalThis.fetch;
 };
+
+/** Result of the public domain search: one entry per requested domain, with current pricing. */
+export type DomainSearchResult = { results: Array<Record<string, unknown>> } & Record<string, unknown>;
 
 type ApiErrorBody = { error?: { code?: string; message?: string; request_id?: string } };
 
@@ -64,6 +69,11 @@ export class KmerHostingClient {
     },
     setAutoRenew: (domainId: string, enabled: boolean, options?: MutationOptions) => this.mutate("PUT", `/v1/domains/${encode(domainId)}/auto-renew`, { enabled }, options),
     setNameservers: (domainId: string, nameServers: string[], options?: MutationOptions) => this.mutate("PUT", `/v1/domains/${encode(domainId)}/nameservers`, { nameServers }, options),
+    /**
+     * Check availability and price of 1 to 20 domains. Public endpoint on domain.kmerhosting.com:
+     * no API key is sent; limited to 20 requests per IP per minute (a bulk search counts once).
+     */
+    search: (domains: string | string[], options?: RequestOptions) => this.searchDomains(domains, options),
   };
 
   readonly email = {
@@ -114,18 +124,32 @@ export class KmerHostingClient {
 
   private readonly apiKey: string;
   private readonly baseUrl: string;
+  private readonly domainSearchUrl: string;
   private readonly fetchImpl: typeof globalThis.fetch;
 
   constructor(options: ClientOptions = {}) {
     this.apiKey = options.apiKey ?? environmentApiKey() ?? "";
     if (!this.apiKey) throw new Error("Set KMERHOSTING_API_KEY or pass apiKey to KmerHostingClient.");
     this.baseUrl = trimBaseUrl(options.baseUrl ?? "https://api.kmerhosting.com");
+    this.domainSearchUrl = trimBaseUrl(options.domainSearchUrl ?? "https://domain.kmerhosting.com");
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     if (!this.fetchImpl) throw new Error("A Fetch implementation is required.");
   }
 
   private async mutate(method: "POST" | "PUT" | "PATCH" | "DELETE", path: string, body: unknown, options: MutationOptions = {}): Promise<ApiEnvelope> {
     return this.request(method, path, body, options, options.idempotencyKey ?? newIdempotencyKey());
+  }
+
+  private async searchDomains(domains: string | string[], options: RequestOptions = {}): Promise<DomainSearchResult> {
+    const list = (Array.isArray(domains) ? domains : [domains]).map((domain) => domain.trim()).filter(Boolean);
+    if (list.length < 1 || list.length > 20) throw new Error("Pass between 1 and 20 domains to domains.search.");
+    const query = new URLSearchParams({ domains: list.join(",") });
+    const response = await this.fetchImpl(`${this.domainSearchUrl}/api/domain-search?${query}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: options.signal,
+    });
+    return this.parse<DomainSearchResult>(response);
   }
 
   private async request<T = unknown>(method: string, path: string, body?: unknown, options: RequestOptions = {}, idempotencyKey?: string): Promise<ApiEnvelope<T>> {
@@ -142,6 +166,10 @@ export class KmerHostingClient {
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: options.signal,
     });
+    return this.parse<ApiEnvelope<T>>(response);
+  }
+
+  private async parse<T>(response: Response): Promise<T> {
     const text = await response.text();
     let payload: unknown = undefined;
     if (text) {
@@ -157,6 +185,6 @@ export class KmerHostingClient {
         payload,
       );
     }
-    return payload as ApiEnvelope<T>;
+    return payload as T;
   }
 }

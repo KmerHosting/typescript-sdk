@@ -129,3 +129,36 @@ test("normalizes non-JSON API failures into KmerHostingError", async () => {
     expect(error).toMatchObject({ status: 502, code: "request_failed" });
   }
 });
+
+test("searches domains on the public service without sending the API key", async () => {
+  const requests: Request[] = [];
+  const client = new KmerHostingClient({
+    apiKey: "kh_live_test",
+    domainSearchUrl: "https://domain.example.test/",
+    fetch: async (input, init) => {
+      requests.push(new Request(input, init));
+      return Response.json({ results: [{ domainName: "example.com" }, { domainName: "example.cm" }] });
+    },
+  });
+
+  const result = await client.domains.search(["example.com", " example.cm "]);
+  expect(result.results).toHaveLength(2);
+  expect(requests).toHaveLength(1);
+  expect(requests[0].method).toBe("GET");
+  expect(requests[0].url).toBe("https://domain.example.test/api/domain-search?domains=example.com%2Cexample.cm");
+  expect(requests[0].headers.get("Authorization")).toBeNull();
+
+  await expect(client.domains.search([])).rejects.toThrow("between 1 and 20");
+  await expect(client.domains.search(Array.from({ length: 21 }, (_, i) => `d${i}.com`))).rejects.toThrow("between 1 and 20");
+});
+
+test("raises KmerHostingError when the domain search is rate limited", async () => {
+  const client = new KmerHostingClient({
+    apiKey: "kh_live_test",
+    fetch: async () => Response.json({ error: { code: "rate_limited", message: "Too many searches." } }, { status: 429 }),
+  });
+  const error = await client.domains.search("example.com").catch((e) => e);
+  expect(error).toBeInstanceOf(KmerHostingError);
+  expect(error.status).toBe(429);
+  expect(error.code).toBe("rate_limited");
+});
