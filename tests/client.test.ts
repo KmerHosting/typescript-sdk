@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { KmerHostingClient, KmerHostingError } from "../src/index";
+import { KmerHostingClient, KmerHostingError, RateLimitError } from "../src/index";
 
 const id = "22222222-2222-4222-8222-222222222222";
 const recordId = "33333333-3333-4333-8333-333333333333";
@@ -161,4 +161,64 @@ test("raises KmerHostingError when the domain search is rate limited", async () 
   expect(error).toBeInstanceOf(KmerHostingError);
   expect(error.status).toBe(429);
   expect(error.code).toBe("rate_limited");
+});
+
+function retryClient(responses: Array<() => Response>, retry: ConstructorParameters<typeof KmerHostingClient>[0] extends infer O ? (O extends { retry?: infer R } ? R : never) : never = {}) {
+  const requests: Request[] = [];
+  const waits: number[] = [];
+  let index = 0;
+  const client = new KmerHostingClient({
+    apiKey: "kh_live_test",
+    baseUrl: "https://example.test",
+    retry: retry === false ? false : { sleep: async (ms) => { waits.push(ms); }, ...retry },
+    fetch: async (input, init) => {
+      requests.push(new Request(input, init));
+      return responses[Math.min(index++, responses.length - 1)]();
+    },
+  });
+  return { client, requests, waits };
+}
+const limited = (retryAfter = "2") => () => Response.json({ error: { code: "rate_limit_exceeded", message: "slow down", request_id: "r1" } }, { status: 429, headers: { "Retry-After": retryAfter, "X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "0" } });
+const okResponse = () => Response.json({ data: { ok: true }, request_id: "r2" }, { status: 200 });
+
+test("retries 429 honoring Retry-After and reuses the idempotency key", async () => {
+  const { client, requests, waits } = retryClient([limited("2"), limited("1"), okResponse]);
+  const result = await client.domains.setAutoRenew(id, true);
+  expect((result as { request_id: string }).request_id).toBe("r2");
+  expect(requests).toHaveLength(3);
+  const keys = requests.map((request) => request.headers.get("Idempotency-Key"));
+  expect(keys[0]).toBeTruthy();
+  expect(new Set(keys).size).toBe(1);
+  expect(waits[0]).toBeGreaterThanOrEqual(2000);
+  expect(waits[1]).toBeGreaterThanOrEqual(1000);
+  expect(waits[1]).toBeLessThan(2000);
+});
+
+test("retries 502, 503 and 504 with bounded backoff", async () => {
+  const { client, requests, waits } = retryClient([() => new Response("", { status: 502 }), () => new Response("", { status: 503 }), okResponse]);
+  await client.account.get();
+  expect(requests).toHaveLength(3);
+  expect(waits[0]).toBeLessThanOrEqual(500);
+  expect(waits[1]).toBeLessThanOrEqual(1000);
+});
+
+test("throws RateLimitError carrying retryAfter after the last attempt", async () => {
+  const { client, requests } = retryClient([limited("7")]);
+  const error = await client.account.get().catch((caught) => caught);
+  expect(error).toBeInstanceOf(RateLimitError);
+  expect(error).toBeInstanceOf(KmerHostingError);
+  expect(error.retryAfter).toBe(7);
+  expect(error.limit).toBe(60);
+  expect(error.status).toBe(429);
+  expect(error.code).toBe("rate_limit_exceeded");
+  expect(requests).toHaveLength(3);
+});
+
+test("does not retry other errors and can be disabled", async () => {
+  const forbidden = retryClient([() => Response.json({ error: { code: "insufficient_scope", message: "no", request_id: "r" } }, { status: 403 })]);
+  await expect(forbidden.client.account.get()).rejects.toBeInstanceOf(KmerHostingError);
+  expect(forbidden.requests).toHaveLength(1);
+  const off = retryClient([limited()], false);
+  await expect(off.client.account.get()).rejects.toBeInstanceOf(RateLimitError);
+  expect(off.requests).toHaveLength(1);
 });
